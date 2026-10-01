@@ -34,6 +34,15 @@ from . import data_service
 from .data_service import REP_IDS
 
 MODEL_NAME = "gpt-4o-mini"
+CONTACT_FIELDS = ("prospect_id", "name", "email")
+PROFILE_FIELDS = (
+    "prospect_id", "name", "annual_revenue", "engagement_history",
+    "account_details", "tech_stack", "enrichment_source",
+)
+
+
+def _allowlisted_values(record, fields):
+    return {field: record[field] for field in fields if field in record}
 
 # ---------------------------------------------------------------------------
 # Tools
@@ -49,7 +58,7 @@ def lookup_offering(offering_id: str) -> dict:
 
 @tool
 def build_prospect_profile(prospect_id: str) -> dict:
-    "Assemble a full prospect profile (engagement history, account details, tech stack) and store it. Returns the profile and a found flag."
+    "Build and store an allowlisted prospect profile. Returns the profile and a found flag."
     existing = data_service.get_profile_from_db(prospect_id)["prospect_profile"]
     if existing is not None:
         return {"prospect_profile": existing, "found": True}
@@ -57,8 +66,8 @@ def build_prospect_profile(prospect_id: str) -> dict:
     if rec is None:
         return {"prospect_profile": None, "found": False}
     built = {
+        **_allowlisted_values(rec, PROFILE_FIELDS),
         "prospect_id": prospect_id,
-        **rec,
         "engagement_history": data_service.fetch_engagement_history(prospect_id),
         "account_details": data_service.fetch_account_details(prospect_id),
         "tech_stack": data_service.fetch_tech_stack(prospect_id),
@@ -103,14 +112,19 @@ def _offering_has_required_fields(offering):
 
 
 @tool
-def score_prospect(prospect_profile: dict, offering: dict | None = None) -> dict:
-    "Score a prospect profile's potential for an offering on a 1-100 scale with a justification. Pass the complete prospect_profile record returned by build_prospect_profile and the complete offering record returned by lookup_offering - ids alone are not enough, so call both of those tools first and unwrap their results before calling this one."
+def score_prospect(prospect_id: str, offering_id: str) -> dict:
+    "Score a prospect against an offering; pass prospect_id and offering_id, not complete records."
+    offering = data_service.get_offering(offering_id)
     if offering is None or not _offering_has_required_fields(offering):
         return {"score": None, "error": "Cannot score without a valid offering."}
-    # Score against the prospect's saved tech stack of record.
-    pid = prospect_profile.get("prospect_id")
-    if pid is not None:
-        prospect_profile = {**prospect_profile, "tech_stack": data_service.fetch_tech_stack(pid)}
+    prospect_profile = data_service.get_profile_from_db(prospect_id)["prospect_profile"]
+    if prospect_profile is None:
+        profile_result = build_prospect_profile.invoke({"prospect_id": prospect_id})
+        prospect_profile = profile_result["prospect_profile"]
+    if prospect_profile is None:
+        return {"score": None, "error": "Cannot score without a valid prospect profile."}
+    prospect_profile = _allowlisted_values(prospect_profile, PROFILE_FIELDS)
+    prospect_profile["tech_stack"] = data_service.fetch_tech_stack(prospect_id)
     user = (
         "Offering:\n" + json.dumps(offering, indent=2) +
         "\n\nProspect profile:\n" + json.dumps(prospect_profile, indent=2)
@@ -128,13 +142,8 @@ def get_prospect(prospect_id: str) -> dict:
     record = data_service.get_prospect_record(prospect_id)
     if record is None:
         return {"prospect": None, "found": False}
-    # Carry the contact fields through, dropping the bulky enrichment blobs the
-    # caller can pull from build_prospect_profile instead.
-    contact = {
-        "prospect_id": prospect_id,
-        **{k: v for k, v in record.items()
-           if k not in ("engagement_history", "account_details", "tech_stack")},
-    }
+    contact = _allowlisted_values(record, CONTACT_FIELDS)
+    contact["prospect_id"] = prospect_id
     return {"prospect": contact, "found": True}
 
 
@@ -149,11 +158,13 @@ def get_current_rep(runtime: ToolRuntime) -> dict:
 
 
 @tool
-def send_prospect_email(prospect: dict, subject: str, body: str, runtime: ToolRuntime, from_rep: dict | None = None) -> dict:
-    "Draft and send an email to the given prospect. Pass the prospect record (with name and email), a subject line, and the message body. The sending rep defaults to the signed-in rep."
+def send_prospect_email(prospect_id: str, subject: str, body: str, runtime: ToolRuntime, from_rep: dict | None = None) -> dict:
+    "Draft and send an email to a prospect by prospect_id; pass a subject and message body."
     if from_rep is None:
         user_id = (runtime.config.get("metadata") or {}).get("user_id")
         from_rep = data_service.get_rep(user_id or "") or {}
+    record = data_service.get_prospect_record(prospect_id)
+    prospect = _allowlisted_values(record or {}, CONTACT_FIELDS)
     to_email = prospect.get("email")
     if not to_email:
         return {"status": "failed", "error": "Prospect record has no email address."}
